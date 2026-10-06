@@ -1,0 +1,16 @@
+Step,Issue,Rows affected,Action,Rationale
+1,Exact duplicate rows,180,Removed (kept first copy),Identical copies; Interaction_ID must be unique
+2,Inconsistent Channel names,42,Standardized,Same values spelled differently
+2,Inconsistent Issue_Category case,250,Standardized,Lowercase variants split one category in group-bys
+3,Invalid Interaction_Date,40,"Set to NULL, row retained",Impossible date; excluded only from time analysis
+3,Invalid Interaction_Time,40,"Set to NULL, row retained",Impossible time; excluded only from hour/shift analysis
+4,Missing Team_ID,150,"Recovered from Agent_ID, flagged",Each agent belongs to exactly one team
+5,Missing Agent_ID,300,"Retained as NULL, flagged",Cannot be inferred; not filled with a fake agent so agent counts stay correct
+6,Negative Interaction_Duration_Min,120,"Absolute value, flagged",Sign-entry error assumption (medians match); confirm with source system
+7,Missing Hold_Time_Min on Chat/Email,18,Set to 0,No digital interaction has hold time > 0
+7,Missing Hold_Time_Min on calls,42,Retained as NULL,Cannot assume 0 for voice calls
+8,Wait_Time_Min above 60 min,60,"Retained, flagged","Nothing between 60 and 180 min, then 60 rows at 180-597; abnormal but not deleted without confirmation"
+9,SLA_Target_Min = 0,100,"Restored from Priority/channel rule, flagged",Rule has no exceptions in other rows
+10,Invalid Customer_Satisfaction,80,Set to NULL,Outside 1-5; imputing would invent survey results
+11,SLA_Met disagrees with Wait <= Target,141,"Retained recorded value, flagged",Cause unknown; report SLA as recorded and as recalculated
+12,FCR = Yes but not Resolved,711,"Retained, flagged",FCR definition decided at KPI stage

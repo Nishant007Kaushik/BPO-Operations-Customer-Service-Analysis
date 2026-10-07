@@ -225,3 +225,165 @@ SELECT volume_quartile,
 FROM vw_agent_segments
 GROUP BY volume_quartile
 ORDER BY volume_quartile;
+SELECT Team_ID, interactions, aht_min, fcr_strict_pct,
+       sla_recorded_pct, csat_avg, escalation_rate_pct
+FROM vw_team_scorecard
+ORDER BY fcr_strict_pct;
+-- Is T05's strict FCR gap broad or concentrated in certain issues?
+WITH cat AS (
+    SELECT Issue_Category,
+           SUM(CASE WHEN Team_ID = 'T05' THEN 1 ELSE 0 END) AS t05_interactions,
+           ROUND(100.0 * SUM(CASE WHEN Team_ID = 'T05' AND First_Call_Resolution = 'Yes'
+                                   AND Resolution_Status = 'Resolved' THEN 1 ELSE 0 END)
+                 / NULLIF(SUM(CASE WHEN Team_ID = 'T05' THEN 1 ELSE 0 END), 0), 2) AS t05_fcr_strict,
+           ROUND(100.0 * SUM(CASE WHEN Team_ID <> 'T05' AND First_Call_Resolution = 'Yes'
+                                   AND Resolution_Status = 'Resolved' THEN 1 ELSE 0 END)
+                 / NULLIF(SUM(CASE WHEN Team_ID <> 'T05' THEN 1 ELSE 0 END), 0), 2) AS other_teams_fcr_strict
+    FROM bpo_interactions
+    GROUP BY Issue_Category
+)
+SELECT Issue_Category, t05_interactions, t05_fcr_strict, other_teams_fcr_strict,
+       ROUND(t05_fcr_strict - other_teams_fcr_strict, 2) AS gap_pts
+FROM cat
+ORDER BY gap_pts;
+-- =====================================================================
+-- SECTION 5: CUSTOMER SERVICE / ISSUE ANALYSIS (Q30-Q35)
+-- Note: the dataset has no "time to resolve" column, so AHT is used as the
+-- measure of effort per issue. Say this in your README.
+-- =====================================================================
+
+CREATE OR REPLACE VIEW vw_issue_scorecard AS
+SELECT
+    Issue_Category,
+    COUNT(*)                                            AS interactions,
+    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2)  AS pct_of_volume,
+    ROUND(AVG(Interaction_Duration_Min + Hold_Time_Min + After_Call_Work_Min), 2) AS aht_min,
+    ROUND(100.0 * SUM(CASE WHEN Resolution_Status = 'Resolved' THEN 1 ELSE 0 END) / COUNT(*), 2) AS resolution_rate_pct,
+    ROUND(100.0 * SUM(CASE WHEN First_Call_Resolution = 'Yes' AND Resolution_Status = 'Resolved' THEN 1 ELSE 0 END) / COUNT(*), 2) AS fcr_strict_pct,
+    ROUND(100.0 * SUM(CASE WHEN Escalation_Status = 'Escalated'   THEN 1 ELSE 0 END) / COUNT(*), 2) AS escalation_rate_pct,
+    ROUND(100.0 * SUM(CASE WHEN Repeat_Interaction = 'Yes'        THEN 1 ELSE 0 END) / COUNT(*), 2) AS repeat_rate_pct,
+    ROUND(100.0 * SUM(CASE WHEN Transfer_Status = 'Transferred'   THEN 1 ELSE 0 END) / COUNT(*), 2) AS transfer_rate_pct,
+    ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'Yes'                   THEN 1 ELSE 0 END) / COUNT(*), 2) AS sla_recorded_pct,
+    ROUND(AVG(Customer_Satisfaction), 2)                AS csat_avg
+FROM bpo_interactions
+GROUP BY Issue_Category;
+
+-- Q30-Q35 in one table, with a rank for each problem metric (1 = worst)
+SELECT Issue_Category, interactions, pct_of_volume, aht_min,
+       resolution_rate_pct, escalation_rate_pct, repeat_rate_pct, csat_avg,
+       RANK() OVER (ORDER BY escalation_rate_pct DESC) AS escalation_rank,
+       RANK() OVER (ORDER BY resolution_rate_pct)      AS lowest_resolution_rank,
+       RANK() OVER (ORDER BY repeat_rate_pct DESC)     AS repeat_rank,
+       RANK() OVER (ORDER BY csat_avg)                 AS lowest_csat_rank,
+       RANK() OVER (ORDER BY aht_min DESC)             AS longest_aht_rank
+FROM vw_issue_scorecard
+ORDER BY interactions DESC;
+
+-- Q30 (detail): the 10 most common issue subcategories, with how concentrated demand is
+WITH sub AS (
+    SELECT Issue_Category, Issue_Subcategory,
+           COUNT(*) AS interactions,
+           ROUND(100.0 * SUM(CASE WHEN Escalation_Status = 'Escalated' THEN 1 ELSE 0 END) / COUNT(*), 2) AS escalation_rate_pct,
+           ROUND(100.0 * SUM(CASE WHEN First_Call_Resolution = 'Yes' AND Resolution_Status = 'Resolved' THEN 1 ELSE 0 END) / COUNT(*), 2) AS fcr_strict_pct,
+           ROUND(100.0 * SUM(CASE WHEN Repeat_Interaction = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2) AS repeat_rate_pct,
+           ROUND(AVG(Customer_Satisfaction), 2) AS csat_avg
+    FROM bpo_interactions
+    GROUP BY Issue_Category, Issue_Subcategory
+)
+SELECT Issue_Category, Issue_Subcategory, interactions,
+       ROUND(100.0 * interactions / SUM(interactions) OVER (), 2) AS pct_of_volume,
+       ROUND(100.0 * SUM(interactions) OVER (ORDER BY interactions DESC
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) / SUM(interactions) OVER (), 2) AS cumulative_pct,
+       escalation_rate_pct, fcr_strict_pct, repeat_rate_pct, csat_avg
+FROM sub
+ORDER BY interactions DESC
+LIMIT 10;
+-- Workload by issue: share of interactions vs share of handling time
+-- Rows with a NULL hold time (42 voice calls) are skipped in the hour totals.
+SELECT Issue_Category,
+       COUNT(*) AS interactions,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct_of_interactions,
+       ROUND(SUM(Interaction_Duration_Min + Hold_Time_Min + After_Call_Work_Min) / 60) AS handling_hours,
+       ROUND(100.0 * SUM(Interaction_Duration_Min + Hold_Time_Min + After_Call_Work_Min)
+             / SUM(SUM(Interaction_Duration_Min + Hold_Time_Min + After_Call_Work_Min)) OVER (), 2) AS pct_of_handling_time
+FROM bpo_interactions
+GROUP BY Issue_Category
+ORDER BY handling_hours DESC;
+-- =====================================================================
+-- SECTION 6: SLA ANALYSIS (Q36-Q40)
+-- Recorded SLA = SLA_Met column | Recalculated = Wait_Time_Min <= SLA_Target_Min
+-- Average wait excludes the 60 flagged outliers (DQ_Wait_Outlier = 1).
+-- =====================================================================
+
+-- Q36: SLA met vs breached, two ways
+SELECT 'Recorded (SLA_Met column)' AS method,
+       SUM(CASE WHEN SLA_Met = 'Yes' THEN 1 ELSE 0 END) AS met,
+       SUM(CASE WHEN SLA_Met = 'No'  THEN 1 ELSE 0 END) AS breached,
+       ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2) AS compliance_pct
+FROM bpo_interactions
+UNION ALL
+SELECT 'Recalculated (wait <= target)',
+       SUM(CASE WHEN Wait_Time_Min <= SLA_Target_Min THEN 1 ELSE 0 END),
+       SUM(CASE WHEN Wait_Time_Min >  SLA_Target_Min THEN 1 ELSE 0 END),
+       ROUND(100.0 * SUM(CASE WHEN Wait_Time_Min <= SLA_Target_Min THEN 1 ELSE 0 END) / COUNT(*), 2)
+FROM bpo_interactions;
+
+-- Q37: SLA by team
+SELECT Team_ID, COUNT(*) AS interactions,
+       ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2) AS sla_pct,
+       ROUND(AVG(CASE WHEN DQ_Wait_Outlier = 0 THEN Wait_Time_Min END), 2) AS avg_wait_min
+FROM bpo_interactions
+GROUP BY Team_ID
+ORDER BY sla_pct;
+
+-- Q38: SLA by hour (compare with volume to see whether weak hours are the busy ones)
+SELECT HOUR(Interaction_Time) AS hour_of_day, COUNT(*) AS interactions,
+       ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2) AS sla_pct,
+       ROUND(AVG(CASE WHEN DQ_Wait_Outlier = 0 THEN Wait_Time_Min END), 2) AS avg_wait_min
+FROM bpo_interactions
+WHERE Interaction_Time IS NOT NULL
+GROUP BY HOUR(Interaction_Time)
+ORDER BY hour_of_day;
+
+-- Q39a: SLA by priority
+SELECT Priority, COUNT(*) AS interactions,
+       ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2) AS sla_pct,
+       ROUND(AVG(CASE WHEN DQ_Wait_Outlier = 0 THEN Wait_Time_Min END), 2) AS avg_wait_min
+FROM bpo_interactions
+GROUP BY Priority
+ORDER BY FIELD(Priority, 'High', 'Medium', 'Low');
+
+-- Q39b: SLA by channel (targets differ by channel, so compare compliance, not wait)
+SELECT Channel, COUNT(*) AS interactions,
+       ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2) AS sla_pct,
+       ROUND(AVG(CASE WHEN DQ_Wait_Outlier = 0 THEN Wait_Time_Min END), 2) AS avg_wait_min
+FROM bpo_interactions
+GROUP BY Channel
+ORDER BY sla_pct;
+
+-- Q40: Which months were weakest?
+WITH monthly AS (
+    SELECT DATE_FORMAT(Interaction_Date, '%Y-%m') AS month,
+           COUNT(*) AS interactions,
+           ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2) AS sla_pct,
+           ROUND(AVG(CASE WHEN DQ_Wait_Outlier = 0 THEN Wait_Time_Min END), 2) AS avg_wait_min
+    FROM bpo_interactions
+    WHERE Interaction_Date IS NOT NULL
+    GROUP BY DATE_FORMAT(Interaction_Date, '%Y-%m')
+)
+SELECT month, interactions, sla_pct, avg_wait_min,
+       ROUND(sla_pct - AVG(sla_pct) OVER (), 2) AS vs_avg_of_months,
+       RANK() OVER (ORDER BY sla_pct)           AS worst_rank
+FROM monthly
+ORDER BY month;
+
+-- Business question D: which issue categories contribute most to SLA breaches?
+SELECT Issue_Category, COUNT(*) AS interactions,
+       SUM(CASE WHEN SLA_Met = 'No' THEN 1 ELSE 0 END) AS breaches,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS pct_of_interactions,
+       ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'No' THEN 1 ELSE 0 END)
+             / SUM(SUM(CASE WHEN SLA_Met = 'No' THEN 1 ELSE 0 END)) OVER (), 2) AS pct_of_breaches,
+       ROUND(100.0 * SUM(CASE WHEN SLA_Met = 'Yes' THEN 1 ELSE 0 END) / COUNT(*), 2) AS sla_pct
+FROM bpo_interactions
+GROUP BY Issue_Category
+ORDER BY pct_of_breaches DESC;

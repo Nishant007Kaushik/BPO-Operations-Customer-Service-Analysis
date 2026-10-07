@@ -387,3 +387,72 @@ SELECT Issue_Category, COUNT(*) AS interactions,
 FROM bpo_interactions
 GROUP BY Issue_Category
 ORDER BY pct_of_breaches DESC;
+-- =====================================================================
+-- SECTION 7: ESCALATION ANALYSIS (Q41-Q45)
+-- Escalation rate = Escalation_Status = 'Escalated' / all interactions
+-- =====================================================================
+
+-- Q41: overall escalation rate
+SELECT COUNT(*) AS interactions,
+       SUM(CASE WHEN Escalation_Status = 'Escalated' THEN 1 ELSE 0 END) AS escalated,
+       ROUND(100.0 * SUM(CASE WHEN Escalation_Status = 'Escalated' THEN 1 ELSE 0 END) / COUNT(*), 2) AS escalation_rate_pct
+FROM bpo_interactions;
+
+-- Q42-Q44: by issue, team, priority (and channel), with each segment's share of all escalations
+WITH e AS (
+    SELECT Issue_Category, Team_ID, Priority, Channel,
+           CASE WHEN Escalation_Status = 'Escalated' THEN 1 ELSE 0 END AS esc
+    FROM bpo_interactions
+),
+dims AS (
+    SELECT 'Issue' AS dimension, Issue_Category AS segment, COUNT(*) AS interactions, SUM(esc) AS escalated FROM e GROUP BY Issue_Category
+    UNION ALL SELECT 'Team',     Team_ID,  COUNT(*), SUM(esc) FROM e GROUP BY Team_ID
+    UNION ALL SELECT 'Priority', Priority, COUNT(*), SUM(esc) FROM e GROUP BY Priority
+    UNION ALL SELECT 'Channel',  Channel,  COUNT(*), SUM(esc) FROM e GROUP BY Channel
+)
+SELECT dimension, segment, interactions, escalated,
+       ROUND(100.0 * escalated / interactions, 2) AS escalation_rate_pct,
+       ROUND(100.0 * interactions / SUM(interactions) OVER (PARTITION BY dimension), 2) AS pct_of_interactions,
+       ROUND(100.0 * escalated   / SUM(escalated)    OVER (PARTITION BY dimension), 2) AS pct_of_escalations
+FROM dims
+ORDER BY dimension, escalation_rate_pct DESC;
+
+-- Q45a: is it the issue, the priority, or both? (escalation % by issue and priority)
+SELECT Issue_Category,
+       ROUND(100.0 * AVG(CASE WHEN Priority = 'High'   THEN (Escalation_Status = 'Escalated') END), 1) AS high_pct,
+       ROUND(100.0 * AVG(CASE WHEN Priority = 'Medium' THEN (Escalation_Status = 'Escalated') END), 1) AS medium_pct,
+       ROUND(100.0 * AVG(CASE WHEN Priority = 'Low'    THEN (Escalation_Status = 'Escalated') END), 1) AS low_pct
+FROM bpo_interactions
+GROUP BY Issue_Category
+ORDER BY high_pct DESC;
+
+-- Q45b: which interaction characteristics go with escalation?
+-- Association only: a long interaction may be a result of escalation, not a cause.
+WITH f AS (
+    SELECT CASE WHEN Escalation_Status = 'Escalated' THEN 1 ELSE 0 END AS esc,
+           Interaction_Duration_Min AS dur, Hold_Time_Min AS hold, Wait_Time_Min AS wait,
+           Repeat_Interaction, Transfer_Status
+    FROM bpo_interactions
+)
+SELECT 'Duration' AS factor,
+       CASE WHEN dur < 5 THEN '1: under 5 min' WHEN dur < 8 THEN '2: 5 to 8' WHEN dur < 12 THEN '3: 8 to 12' ELSE '4: 12+' END AS band,
+       COUNT(*) AS n, ROUND(100.0 * AVG(esc), 2) AS escalation_rate_pct
+FROM f GROUP BY 2
+UNION ALL
+SELECT 'Hold time',
+       CASE WHEN hold = 0 THEN '1: none' WHEN hold <= 3 THEN '2: up to 3 min' ELSE '3: over 3 min' END,
+       COUNT(*), ROUND(100.0 * AVG(esc), 2)
+FROM f WHERE hold IS NOT NULL GROUP BY 2
+UNION ALL
+SELECT 'Wait time',
+       CASE WHEN wait <= 2 THEN '1: up to 2 min' WHEN wait <= 4 THEN '2: 2 to 4' WHEN wait <= 8 THEN '3: 4 to 8' ELSE '4: over 8' END,
+       COUNT(*), ROUND(100.0 * AVG(esc), 2)
+FROM f GROUP BY 2
+UNION ALL
+SELECT 'Repeat contact', CASE WHEN Repeat_Interaction = 'Yes' THEN 'Repeat' ELSE 'First contact' END,
+       COUNT(*), ROUND(100.0 * AVG(esc), 2)
+FROM f GROUP BY 2
+UNION ALL
+SELECT 'Transfer', Transfer_Status, COUNT(*), ROUND(100.0 * AVG(esc), 2)
+FROM f GROUP BY 2
+ORDER BY factor, band;

@@ -10,7 +10,7 @@ An end-to-end analysis of 60,000 customer service interactions from a synthetic 
 
 ## Dataset
 
-- Synthetic BPO operations data: 60,180 raw rows, cleaned to **60,000 rows x 35 columns**
+- Synthetic BPO operations data: 60,180 raw rows, of which 180 were exact duplicates removed, leaving **60,000 rows x 35 columns**
 - 7 `DQ_` flag columns mark values that were corrected or recovered during cleaning
 - 8 teams, Jan to Dec 2025
 - 40 interactions (0.07%) have no date. They are excluded from monthly trends but included in all totals.
